@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: hyperedit-ui
+    env: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_FFMPEG_SERVER_URL
+        placeholder: "Your Google Cloud Run URL (e.g. https://server-xyz.a.run.app)"

@@ -13,7 +13,8 @@ import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPane
 import TimelineTabs from '@/react-app/components/TimelineTabs';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film, Save } from 'lucide-react';
+import { LOCAL_FFMPEG_URL } from '@/react-app/constants';
 import type { TemplateId } from '@/remotion/templates';
 
 interface ChapterData {
@@ -35,6 +36,10 @@ export default function Home() {
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
   const [activeAgent, setActiveAgent] = useState<'director' | 'picasso' | 'dicaprio'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
+  const [showSkillModal, setShowSkillModal] = useState(false);
+  const [skillName, setSkillName] = useState('');
+  const [skillDesc, setSkillDesc] = useState('');
+  const [skillStatus, setSkillStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
 
   const videoPreviewRef = useRef<VideoPreviewHandle>(null);
   const playbackRef = useRef<number | null>(null);
@@ -565,7 +570,7 @@ export default function Home() {
     console.log('Command:', command);
 
     // Call the server to process the video with FFmpeg
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/process-asset`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/process-asset`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -641,7 +646,7 @@ export default function Home() {
     console.log('Generating chapters and making cuts...');
 
     // Generate chapters using the session API
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/chapters`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/chapters`, {
       method: 'POST',
     });
 
@@ -671,7 +676,7 @@ export default function Home() {
     console.log('Cut timestamps:', cutTimestamps);
 
     // Get current project state from server
-    const projectResponse = await fetch(`http://localhost:3333/session/${session.sessionId}/project`);
+    const projectResponse = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`);
     const projectData = await projectResponse.json();
     let currentClips: TimelineClip[] = projectData.clips || [];
 
@@ -725,7 +730,7 @@ export default function Home() {
 
     // Save the modified clips directly to server
     if (cutsApplied > 0) {
-      await fetch(`http://localhost:3333/session/${session.sessionId}/project`, {
+      await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...projectData, clips: currentClips }),
@@ -755,7 +760,7 @@ export default function Home() {
     }
 
     // Call the transcribe-and-extract endpoint
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/transcribe-and-extract`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/transcribe-and-extract`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
@@ -793,7 +798,7 @@ export default function Home() {
     }
 
     // Call the generate-broll endpoint
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-broll`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/generate-broll`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
@@ -843,12 +848,12 @@ export default function Home() {
     // Actually, let's just save directly to server and reload
 
     // Save clips directly to server
-    const projectResponse = await fetch(`http://localhost:3333/session/${session.sessionId}/project`);
+    const projectResponse = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`);
     const projectData = await projectResponse.json();
 
     const updatedClips = [...(projectData.clips || []), ...newClips];
 
-    await fetch(`http://localhost:3333/session/${session.sessionId}/project`, {
+    await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -881,7 +886,7 @@ export default function Home() {
 
     // Call the remove-dead-air endpoint
     // -26dB catches real pauses, 0.4s avoids cutting natural speech rhythm
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/remove-dead-air`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/remove-dead-air`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -944,7 +949,7 @@ export default function Home() {
     }
 
     // Call the transcribe endpoint
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/transcribe`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/transcribe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ assetId: videoAsset.id }),
@@ -1052,7 +1057,7 @@ export default function Home() {
 
     try {
       // Call the server to render the motion graphic
-      const response = await fetch(`http://localhost:3333/session/${session.sessionId}/render-motion-graphic`, {
+      const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/render-motion-graphic`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1119,7 +1124,7 @@ export default function Home() {
       console.log(`[Animation] Creating with video context: ${videoAssetId || 'none'}, time range: ${startTime !== undefined ? `${startTime}s` : 'auto'}${endTime !== undefined ? ` - ${endTime}s` : ''}${attachedAssetIds?.length ? `, attached assets: ${attachedAssetIds.length}` : ''}${durationSeconds ? `, duration: ${durationSeconds}s` : ''}`);
 
       // Call the server to generate AI animation with video context
-      const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-animation`, {
+      const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/generate-animation`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1210,7 +1215,7 @@ export default function Home() {
     // Debug: log the time range being sent to server
     console.log('[DEBUG] Sending analyze-for-animation with timeRange:', JSON.stringify(request.timeRange));
 
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/analyze-for-animation`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/analyze-for-animation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1250,7 +1255,7 @@ export default function Home() {
       throw new Error('Please upload a video first to start a session');
     }
 
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/render-from-concept`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/render-from-concept`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1313,7 +1318,7 @@ export default function Home() {
       throw new Error('Please upload a video first to start a session');
     }
 
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-transcript-animation`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/generate-transcript-animation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1352,7 +1357,7 @@ export default function Home() {
       throw new Error('Please upload a video first to start a session');
     }
 
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-batch-animations`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/generate-batch-animations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1405,7 +1410,7 @@ export default function Home() {
       throw new Error('No video asset found');
     }
 
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/extract-audio`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/extract-audio`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1462,7 +1467,7 @@ export default function Home() {
       // 2. Analyze the content with AI
       // 3. Generate Remotion code based on the content
       // 4. Render the animation
-      const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-contextual-animation`, {
+      const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/generate-contextual-animation`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1548,7 +1553,7 @@ export default function Home() {
         duration: a.duration,
       }));
 
-    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/edit-animation`, {
+    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/edit-animation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1673,6 +1678,17 @@ export default function Home() {
                   Export
                 </button>
               )}
+              <button
+                onClick={() => {
+                  setSkillName(`skill-${(session?.sessionId || legacySession?.sessionId || '').substring(0, 6)}`);
+                  setShowSkillModal(true);
+                }}
+                disabled={isProcessing}
+                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
+              >
+                <Save className="w-4 h-4" />
+                Save Skill
+              </button>
             </>
           )}
           <button className="px-4 py-2 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 rounded-lg text-sm font-medium transition-all">
@@ -1680,6 +1696,77 @@ export default function Home() {
           </button>
         </div>
       </header>
+
+      {/* Skill Export Modal */}
+      {showSkillModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+          <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-md w-full p-6 shadow-2xl">
+            <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
+              <Save className="text-orange-500" />
+              Export as workflow skill
+            </h2>
+            <p className="text-sm text-zinc-400 mb-6">
+              This will summarize your current session and save it as a "Skill" file in your project. Your agents will automatically learn this editing style.
+            </p>
+            
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-zinc-500 uppercase mb-1">Skill Name</label>
+                <input 
+                  type="text"
+                  value={skillName}
+                  onChange={(e) => setSkillName(e.target.value)}
+                  placeholder="e.g., dynamic-real-estate-edit"
+                  className="w-full bg-black border border-zinc-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-orange-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-500 uppercase mb-1">Description</label>
+                <textarea 
+                  value={skillDesc}
+                  onChange={(e) => setSkillDesc(e.target.value)}
+                  placeholder="Describe what this skill does..."
+                  className="w-full bg-black border border-zinc-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-orange-500 h-24 resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="mt-8 flex gap-3">
+              <button
+                onClick={() => setShowSkillModal(false)}
+                className="flex-1 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-sm font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  setSkillStatus('saving');
+                  try {
+                    const id = session?.sessionId || legacySession?.sessionId;
+                    const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${id}/export-skill`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ name: skillName, description: skillDesc }),
+                    });
+                    if (!response.ok) throw new Error('Failed to save skill');
+                    setSkillStatus('success');
+                    setTimeout(() => {
+                      setShowSkillModal(false);
+                      setSkillStatus('idle');
+                    }, 1500);
+                  } catch (e) {
+                    setSkillStatus('error');
+                  }
+                }}
+                disabled={skillStatus === 'saving' || !skillName}
+                className="flex-1 px-4 py-2 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
+              >
+                {skillStatus === 'saving' ? 'Synthesizing...' : skillStatus === 'success' ? 'Saved!' : 'Save Skill'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Timeline Tabs */}
       <TimelineTabs

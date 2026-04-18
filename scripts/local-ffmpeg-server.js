@@ -1,12 +1,20 @@
 import http from 'http';
 import { spawn, execSync } from 'child_process';
-import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join } from 'path';
+import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'fs';
+import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import formidable from 'formidable';
-import { GoogleGenAI } from '@google/genai';
 import { fal } from '@fal-ai/client';
+
+// Note: GoogleGenAI has been replaced by NVIDIA NIM (MiniMax)
+import { GoogleGenAI } from '@google/genai';
+import speech from '@google-cloud/speech';
+
+// Environment-aware commands and paths
+const isLinux = process.platform === 'linux';
+const FFMPEG_CMD = isLinux ? 'ffmpeg' : 'C:\\Users\\jhula\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1-full_build\\bin\\ffmpeg.exe';
+const FFPROBE_CMD = isLinux ? 'ffprobe' : 'C:\\Users\\jhula\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1-full_build\\bin\\ffprobe.exe';
 
 // Load environment variables from .dev.vars
 function loadEnvVars() {
@@ -27,14 +35,67 @@ function loadEnvVars() {
 }
 loadEnvVars();
 
+/**
+ * Helper to call NVIDIA NIM Chat Completion API (MiniMax M2.5)
+ * Standard OpenAI-compatible format
+ */
+async function callNvidiaChat(messages, systemPrompt = null) {
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) {
+    throw new Error('NVIDIA_API_KEY not configured in .dev.vars');
+  }
+
+  const payload = {
+    model: "minimaxai/minimax-m2.5",
+    messages: []
+  };
+
+  if (systemPrompt) {
+    payload.messages.push({ role: "system", content: systemPrompt });
+  }
+
+  // Convert Gemini-style "parts" to OpenAI roles if needed
+  // But here we'll assume messages is an array of objects {role, content}
+  payload.messages.push(...messages);
+
+  try {
+    const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`NVIDIA NIM API Error (${response.status}): ${errorText}`);
+    }
+
+    const result = await response.json();
+    return result.choices[0].message.content;
+  } catch (err) {
+    console.error('[NVIDIA NIM] Request failed:', err.message);
+    throw err;
+  }
+}
+
+/**
+ * Unified helper for simpler generation calls
+ */
+async function generateNvidiaResponse(prompt, systemPrompt = null) {
+  return await callNvidiaChat([{ role: "user", content: prompt }], systemPrompt);
+}
+
 // Configure fal.ai client - SDK expects FAL_KEY env var or credentials config
 // Map FAL_API_KEY to FAL_KEY for backward compatibility
 if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
   process.env.FAL_KEY = process.env.FAL_API_KEY;
 }
 
-const PORT = 3333;
-const TEMP_DIR = join(tmpdir(), 'hyperedit-ffmpeg');
+const PORT = process.env.PORT || 3333;
+const TEMP_DIR = process.env.TEMP_DIR || (isLinux ? '/tmp/hyperedit' : 'D:\\hyperedit-ffmpeg');
 const SESSIONS_DIR = join(TEMP_DIR, 'sessions');
 
 // Active video sessions - keeps videos on disk between edits
@@ -171,6 +232,7 @@ function restoreSessionsFromDisk() {
       assets,
       project: projectState,
       transcriptCache: new Map(),
+      action_history: [],
     };
 
     sessions.set(sessionId, session);
@@ -256,10 +318,29 @@ function createSession(originalName) {
     assets: new Map(), // assetId -> asset info
     project: projectState,
     transcriptCache: new Map(), // assetId -> { text, words, cachedAt }
+    action_history: [],
   };
   sessions.set(sessionId, session);
   console.log(`[Session] Created: ${sessionId}`);
   return session;
+}
+
+// Log session activity for skill synthesis
+function logSessionActivity(session, action, data = {}) {
+  const entry = {
+    timestamp: Date.now(),
+    action,
+    data
+  };
+  session.action_history.push(entry);
+
+  // Also save to a file in the session dir
+  try {
+    const historyPath = join(session.dir, 'action_history.json');
+    writeFileSync(historyPath, JSON.stringify(session.action_history, null, 2));
+  } catch (e) {
+    console.error('Failed to save action history:', e.message);
+  }
 }
 
 function getSession(sessionId) {
@@ -270,7 +351,6 @@ function cleanupSession(sessionId) {
   const session = sessions.get(sessionId);
   if (session) {
     try {
-      const { rmSync } = require('fs');
       rmSync(session.dir, { recursive: true, force: true });
       sessions.delete(sessionId);
       console.log(`[Session] Cleaned up: ${sessionId}`);
@@ -294,7 +374,8 @@ setInterval(() => {
 // Run FFmpeg command and return a promise
 function runFFmpeg(args, jobId) {
   return new Promise((resolve, reject) => {
-    const ffmpeg = spawn('ffmpeg', args);
+    console.log(`[${jobId}] Running FFmpeg with args:`, args);
+    const ffmpeg = spawn(FFMPEG_CMD, args);
     let stderr = '';
 
     ffmpeg.stderr.on('data', (data) => {
@@ -321,7 +402,7 @@ function runFFmpeg(args, jobId) {
 // Run FFprobe command and return stdout
 function runFFmpegProbe(args, jobId) {
   return new Promise((resolve, reject) => {
-    const ffprobe = spawn('ffprobe', args);
+    const ffprobe = spawn(FFPROBE_CMD, args);
     let stdout = '';
     let stderr = '';
 
@@ -391,7 +472,7 @@ async function detectSilence(inputPath, jobId, options = {}) {
 async function getVideoDuration(inputPath) {
   try {
     const result = execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`,
+      `"${FFPROBE_CMD}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`,
       { encoding: 'utf-8' }
     );
     const duration = parseFloat(result.trim());
@@ -558,7 +639,7 @@ async function handleRemoveDeadAir(req, res) {
         unlinkSync(inputPath);
         unlinkSync(outputPath);
         unlinkSync(concatListPath);
-        segmentPaths.forEach(p => { try { unlinkSync(p); } catch {} });
+        segmentPaths.forEach(p => { try { unlinkSync(p); } catch { } });
         console.log(`[${jobId}] Cleaned up temp files`);
       } catch (e) {
         console.error(`[${jobId}] Cleanup error:`, e.message);
@@ -569,10 +650,10 @@ async function handleRemoveDeadAir(req, res) {
     console.error(`[${jobId}] Error:`, error.message);
 
     // Cleanup on error
-    try { unlinkSync(inputPath); } catch {}
-    try { unlinkSync(outputPath); } catch {}
-    try { unlinkSync(concatListPath); } catch {}
-    segmentPaths.forEach(p => { try { unlinkSync(p); } catch {} });
+    try { unlinkSync(inputPath); } catch { }
+    try { unlinkSync(outputPath); } catch { }
+    try { unlinkSync(concatListPath); } catch { }
+    segmentPaths.forEach(p => { try { unlinkSync(p); } catch { } });
 
     res.writeHead(500, {
       'Content-Type': 'application/json',
@@ -664,7 +745,7 @@ async function handleProcess(req, res) {
     console.log(`[${jobId}] FFmpeg args:`, args);
 
     // Run FFmpeg
-    const ffmpeg = spawn('ffmpeg', args);
+    const ffmpeg = spawn(FFMPEG_CMD, args);
 
     let stderr = '';
 
@@ -720,8 +801,8 @@ async function handleProcess(req, res) {
     console.error(`[${jobId}] Error:`, error.message);
 
     // Cleanup on error
-    try { unlinkSync(inputPath); } catch {}
-    try { unlinkSync(outputPath); } catch {}
+    try { unlinkSync(inputPath); } catch { }
+    try { unlinkSync(outputPath); } catch { }
 
     res.writeHead(500, {
       'Content-Type': 'application/json',
@@ -802,33 +883,28 @@ async function handleGenerateChapters(req, res) {
     const audioStats = await stat(audioPath);
     console.log(`\n[${jobId}] Audio extracted: ${(audioStats.size / 1024 / 1024).toFixed(1)} MB`);
 
-    // Step 3: Read audio file as base64
-    console.log(`[${jobId}] Sending to Gemini for analysis...`);
-    const audioBuffer = readFileSync(audioPath);
-    const audioBase64 = audioBuffer.toString('base64');
+    // Step 4: Transcribe audio for analysis (since MiniMax is text-only on NIM)
+    console.log(`[${jobId}] Transcribing audio with Whisper for analysis...`);
+    const transcription = await transcribeVideo(inputPath, jobId);
+    const transcriptText = transcription.text;
 
-    // Step 4: Send to Gemini for transcription and chapter analysis
-    const ai = new GoogleGenAI({ apiKey });
+    if (!transcriptText) {
+      throw new Error('Transcription returned no text for analysis');
+    }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              inlineData: {
-                mimeType: 'audio/mp3',
-                data: audioBase64
-              }
-            },
-            {
-              text: `Analyze this audio from a video that is ${totalDuration.toFixed(1)} seconds long.
+    // Step 5: Send transcript to NVIDIA NIM (MiniMax) for chapter analysis
+    console.log(`[${jobId}] Sending to NVIDIA NIM (MiniMax) for analysis...`);
+
+    const prompt = `Analyze this transcript from a video that is ${totalDuration.toFixed(1)} seconds long.
+The transcript is:
+"""
+${transcriptText}
+"""
 
 Your task is to identify logical chapter breaks based on topic changes, new sections, or natural transitions in the content.
 
 For each chapter:
-1. Identify the START timestamp (in seconds from the beginning)
+1. Identify the APPROXIMATE START timestamp (based on content)
 2. Create a concise, descriptive title (2-6 words)
 
 Guidelines:
@@ -849,18 +925,10 @@ Return your response as valid JSON with exactly this structure:
   "summary": "Brief 1-2 sentence summary of the video content"
 }
 
-Only return the JSON, no other text.`
-            }
-          ]
-        }
-      ],
-      config: {
-        responseMimeType: 'application/json',
-      }
-    });
+Only return the JSON, no other text.`;
 
-    const responseText = response.text || '{}';
-    console.log(`[${jobId}] Gemini response received`);
+    const responseText = await generateNvidiaResponse(prompt, "You are a professional video editor and content strategist.");
+    console.log(`[${jobId}] NVIDIA NIM response received`);
 
     let result;
     try {
@@ -906,8 +974,8 @@ Only return the JSON, no other text.`
     console.error(`[${jobId}] Error:`, error.message);
 
     // Cleanup on error
-    try { unlinkSync(inputPath); } catch {}
-    try { unlinkSync(audioPath); } catch {}
+    try { unlinkSync(inputPath); } catch { }
+    try { unlinkSync(audioPath); } catch { }
 
     res.writeHead(500, {
       'Content-Type': 'application/json',
@@ -1245,7 +1313,7 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
 
     // Verify output has audio before replacing original
     const probeResult = execSync(
-      `ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "${outputPath}"`,
+      `"${FFPROBE_CMD}" -v error -show_entries stream=codec_type -of csv=p=0 "${outputPath}"`,
       { encoding: 'utf-8' }
     );
     const streams = probeResult.trim().split('\n');
@@ -1257,14 +1325,14 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
 
     // Also probe the ORIGINAL file for comparison
     const origProbe = execSync(
-      `ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "${videoAsset.path}"`,
+      `"${FFPROBE_CMD}" -v error -show_entries stream=codec_type -of csv=p=0 "${videoAsset.path}"`,
       { encoding: 'utf-8' }
     );
     console.log(`🔍 [${jobId}]   Original streams: ${origProbe.trim().split('\n').join(', ')}`);
 
     // Cleanup segments
-    segmentPaths.forEach(p => { try { unlinkSync(p); } catch {} });
-    try { unlinkSync(concatListPath); } catch {}
+    segmentPaths.forEach(p => { try { unlinkSync(p); } catch { } });
+    try { unlinkSync(concatListPath); } catch { }
 
     // Replace the video asset file
     const { rename, stat } = await import('fs/promises');
@@ -1272,8 +1340,8 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
     await rename(outputPath, videoAsset.path);
 
     // Cleanup segments
-    segmentPaths.forEach(p => { try { unlinkSync(p); } catch {} });
-    try { unlinkSync(concatListPath); } catch {}
+    segmentPaths.forEach(p => { try { unlinkSync(p); } catch { } });
+    try { unlinkSync(concatListPath); } catch { }
 
     const newStats = await stat(videoAsset.path);
 
@@ -1297,7 +1365,7 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
 
   } catch (error) {
     console.error(`[${jobId}] Error:`, error.message);
-    segmentPaths.forEach(p => { try { unlinkSync(p); } catch {} });
+    segmentPaths.forEach(p => { try { unlinkSync(p); } catch { } });
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ error: error.message }));
   }
@@ -1366,19 +1434,23 @@ async function handleSessionChapters(req, res, sessionId) {
     const audioStats = await stat(audioPath);
     console.log(`\n[${jobId}] Audio: ${(audioStats.size / 1024 / 1024).toFixed(1)} MB`);
 
-    // Send to Gemini
-    console.log(`[${jobId}] Analyzing with Gemini...`);
-    const audioBuffer = readFileSync(audioPath);
-    const audioBase64 = audioBuffer.toString('base64');
+    // Step 4: Transcribe audio for analysis (MiniMax on NIM is text-only)
+    console.log(`[${jobId}] Transcribing audio with Whisper for analysis...`);
+    const transcription = await transcribeVideo(videoPath, jobId);
+    const transcriptText = transcription.text;
 
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{
-        role: 'user',
-        parts: [
-          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-          { text: `Analyze this audio from a video that is ${totalDuration.toFixed(1)} seconds long.
+    if (!transcriptText) {
+      throw new Error('Transcription returned no text for analysis');
+    }
+
+    // Step 5: Send transcript to NVIDIA NIM (MiniMax) for chapter analysis
+    console.log(`[${jobId}] Sending to NVIDIA NIM (MiniMax) for analysis...`);
+
+    const prompt = `Analyze this transcript from a video that is ${totalDuration.toFixed(1)} seconds long.
+The transcript is:
+"""
+${transcriptText}
+"""
 
 Identify logical chapter breaks based on topic changes or natural transitions.
 
@@ -1392,29 +1464,16 @@ Guidelines:
 - At least 30 seconds apart
 - Engaging titles for YouTube
 
-Return JSON: {"chapters": [{"start": 0, "title": "Introduction"}], "summary": "Brief summary"}` }
-        ]
-      }],
-      config: { responseMimeType: 'application/json' }
-    });
+Return JSON exactly in this format: {"chapters": [{"start": 0, "title": "Introduction"}], "summary": "Brief summary"}`;
 
-    // Get the response text - handle different SDK versions
-    let responseText = '';
-    if (typeof response.text === 'function') {
-      responseText = await response.text();
-    } else if (response.text) {
-      responseText = response.text;
-    } else if (response.candidates && response.candidates[0]?.content?.parts?.[0]?.text) {
-      responseText = response.candidates[0].content.parts[0].text;
-    }
-
-    console.log(`[${jobId}] Gemini response:`, responseText.substring(0, 500));
+    const responseText = await generateNvidiaResponse(prompt, "You are a professional video content strategist.");
+    console.log(`[${jobId}] NVIDIA NIM response received`);
 
     let result;
     try {
-      result = JSON.parse(responseText || '{}');
+      result = JSON.parse(responseText);
     } catch {
-      const match = (responseText || '').match(/\{[\s\S]*\}/);
+      const match = responseText.match(/\{[\s\S]*\}/);
       result = match ? JSON.parse(match[0]) : { chapters: [], summary: '' };
     }
 
@@ -1445,7 +1504,7 @@ Return JSON: {"chapters": [{"start": 0, "title": "Introduction"}], "summary": "B
       .join('\n');
 
     // Cleanup
-    try { unlinkSync(audioPath); } catch {}
+    try { unlinkSync(audioPath); } catch { }
 
     console.log(`[${jobId}] Generated ${result.chapters?.length || 0} chapters`);
 
@@ -1460,7 +1519,7 @@ Return JSON: {"chapters": [{"start": 0, "title": "Introduction"}], "summary": "B
 
   } catch (error) {
     console.error(`[${jobId}] Error:`, error.message);
-    try { unlinkSync(audioPath); } catch {}
+    try { unlinkSync(audioPath); } catch { }
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ error: error.message }));
   }
@@ -1536,7 +1595,7 @@ async function generateThumbnail(inputPath, outputPath, isImage = false) {
 async function getMediaInfo(inputPath) {
   try {
     const result = execSync(
-      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration -of json "${inputPath}"`,
+      `"${FFPROBE_CMD}" -v error -select_streams v:0 -show_entries stream=width,height,duration -of json "${inputPath}"`,
       { encoding: 'utf-8' }
     );
     const info = JSON.parse(result);
@@ -2084,7 +2143,6 @@ async function handleRenderDownload(req, res, sessionId, renderType) {
   }
 
   // Find the render file
-  const { readdirSync } = require('fs');
   const files = readdirSync(session.rendersDir);
 
   let renderFile;
@@ -2357,17 +2415,17 @@ function extractKeywordsFromTranscript(transcript, words) {
   return foundKeywords;
 }
 
-// Transcribe video using OpenAI Whisper API
+// Transcribe video using Google Cloud Speech-to-Text
 async function transcribeVideo(videoPath, jobId) {
-  const audioPath = join(TEMP_DIR, `${jobId}-audio-whisper.mp3`);
+  const audioPath = join(TEMP_DIR, `${jobId}-audio-google.wav`);
 
   try {
-    // Extract audio
-    console.log(`[${jobId}] Extracting audio for transcription...`);
+    // Extract audio (Linear16 WAV is preferred for Google Speech-to-Text)
+    console.log(`[${jobId}] Extracting audio for Google transcription...`);
     await runFFmpeg([
       '-y', '-i', videoPath,
-      '-vn', '-acodec', 'libmp3lame',
-      '-ab', '64k', '-ar', '16000', '-ac', '1',
+      '-vn', '-acodec', 'pcm_s16le',
+      '-ar', '16000', '-ac', '1',
       audioPath
     ], jobId);
 
@@ -2375,53 +2433,56 @@ async function transcribeVideo(videoPath, jobId) {
     const audioStats = await stat(audioPath);
     console.log(`\n[${jobId}] Audio extracted: ${(audioStats.size / 1024 / 1024).toFixed(1)} MB`);
 
-    // Check for OpenAI API key
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      throw new Error('OPENAI_API_KEY not configured in .dev.vars');
-    }
+    console.log(`[${jobId}] Sending to Google Cloud Speech-to-Text...`);
+    
+    // Initialize Google Speech Client
+    const client = new speech.SpeechClient();
 
-    // Send to Whisper API
-    console.log(`[${jobId}] Sending to Whisper API...`);
-    const audioBuffer = readFileSync(audioPath);
-    const audioBlob = new Blob([audioBuffer], { type: 'audio/mp3' });
-
-    const formData = new FormData();
-    formData.append('file', audioBlob, 'audio.mp3');
-    formData.append('model', 'whisper-1');
-    formData.append('response_format', 'verbose_json');
-    formData.append('timestamp_granularities[]', 'word');
-
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: formData,
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Whisper API error: ${response.status} - ${errorText}`);
-    }
-
-    const result = await response.json();
-    console.log(`[${jobId}] Transcription complete: ${result.text?.length || 0} characters`);
-
-    // Cleanup
-    try { unlinkSync(audioPath); } catch {}
-
-    return {
-      text: result.text || '',
-      words: result.words || [],
-      duration: result.duration || 0,
+    const audioBytes = readFileSync(audioPath).toString('base64');
+    
+    const audio = {
+      content: audioBytes,
+    };
+    
+    const config = {
+      encoding: 'LINEAR16',
+      sampleRateHertz: 16000,
+      languageCode: 'en-US',
+      enableWordTimeOffsets: true,
+      model: 'latest_long', // Optimized for video/long-form content
     };
 
+    const request = {
+      audio: audio,
+      config: config,
+    };
+
+    // Detects speech in the audio file
+    const [response] = await client.recognize(request);
+    
+    const transcription = response.results
+      .map(result => result.alternatives[0].transcript)
+      .join('\n');
+
+    console.log(`\n[${jobId}] Google Transcription successful.`);
+
+    // Map Google response format to match what the rest of the app expects (approximate)
+    // The previous app expected a Whisper-like structure with .text
+    return {
+      text: transcription,
+      results: response.results // Keep raw results just in case
+    };
   } catch (error) {
-    try { unlinkSync(audioPath); } catch {}
+    console.error(`\n[${jobId}] Google Transcription error:`, error.message);
     throw error;
+  } finally {
+    // Clean up temp audio file
+    if (existsSync(audioPath)) {
+      try { unlinkSync(audioPath); } catch (e) {}
+    }
   }
 }
+
 
 // Search GIPHY for a keyword
 async function searchGiphy(keyword, limit = 1) {
@@ -2500,8 +2561,8 @@ async function downloadGifAsAsset(session, gifUrl, keyword, timestamp) {
     return asset;
 
   } catch (error) {
-    try { unlinkSync(gifPath); } catch {}
-    try { unlinkSync(thumbPath); } catch {}
+    try { unlinkSync(gifPath); } catch { }
+    try { unlinkSync(thumbPath); } catch { }
     throw error;
   }
 }
@@ -2659,7 +2720,9 @@ async function handleGiphyAdd(req, res, sessionId) {
 // Check if local Whisper is available
 async function checkLocalWhisper() {
   return new Promise((resolve) => {
-    const check = spawn('python3', ['-c', 'import whisper; print("ok")']);
+    const ffmpegDir = dirname(FFMPEG_CMD);
+    const env = { ...process.env, PATH: `${ffmpegDir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH}` };
+    const check = spawn('python', ['-c', 'import whisper; print("ok")'], { env });
     let output = '';
     check.stdout.on('data', (data) => { output += data.toString(); });
     check.on('close', (code) => {
@@ -2675,7 +2738,9 @@ async function runLocalWhisper(audioPath, jobId) {
 
   return new Promise((resolve, reject) => {
     console.log(`[${jobId}] Running local Whisper...`);
-    const whisperProcess = spawn('python3', [scriptPath, audioPath, 'base']);
+    const ffmpegDir = dirname(FFMPEG_CMD);
+    const env = { ...process.env, PATH: `${ffmpegDir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH}` };
+    const whisperProcess = spawn('python', [scriptPath, audioPath, 'base'], { env });
 
     let stdout = '';
     let stderr = '';
@@ -2821,7 +2886,7 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
   }
 
   // Clean up audio file
-  try { unlinkSync(audioPath); } catch {}
+  try { unlinkSync(audioPath); } catch { }
 
   // Cache the transcript
   session.transcriptCache.set(videoAsset.id, {
@@ -3000,6 +3065,19 @@ async function handleTranscribe(req, res, sessionId) {
 
     console.log(`[${jobId}] Transcribing: ${videoAsset.filename}`);
 
+    // Verify output has audio
+    const probeResult = execSync(
+      `"${FFPROBE_CMD}" -v error -show_entries stream=codec_type -of csv=p=0 "${videoAsset.path}"`,
+      { encoding: 'utf-8' }
+    );
+    const streams = probeResult.trim().split('\n');
+    if (!streams.includes('audio')) {
+      console.log(`[${jobId}] No audio track found in video.`);
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'This video does not contain an audio track, so captions cannot be generated.' }));
+      return;
+    }
+
     // Get video duration
     const totalDuration = await getVideoDuration(videoAsset.path);
     console.log(`[${jobId}] Video duration: ${totalDuration.toFixed(2)}s`);
@@ -3036,10 +3114,12 @@ async function handleTranscribe(req, res, sessionId) {
 
           const response = await ai.models.generateContent({
             model: 'gemini-2.0-flash',
-            contents: [{ role: 'user', parts: [
-              { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-              { text: `Transcribe this audio with word-level timestamps. Duration: ${totalDuration.toFixed(1)}s. Return JSON: {"text": "full text", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
-            ]}]
+            contents: [{
+              role: 'user', parts: [
+                { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+                { text: `Transcribe this audio with word-level timestamps. Duration: ${totalDuration.toFixed(1)}s. Return JSON: {"text": "full text", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+              ]
+            }]
           });
 
           const responseText = response.text || '';
@@ -3192,7 +3272,7 @@ Guidelines:
     }
 
     // Cleanup
-    try { unlinkSync(audioPath); } catch {}
+    try { unlinkSync(audioPath); } catch { }
 
     const words = (transcription.words || []).map(w => ({
       text: w.text || '',
@@ -3231,7 +3311,7 @@ Guidelines:
 
   } catch (error) {
     console.error(`[${jobId}] Error:`, error.message);
-    try { unlinkSync(audioPath); } catch {}
+    try { unlinkSync(audioPath); } catch { }
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ error: error.message }));
   }
@@ -3291,7 +3371,7 @@ async function handleTranscribeAndExtract(req, res, sessionId) {
         if (gifs.length > 0) {
           // Get the fixed height small GIF URL
           const gifUrl = gifs[0].images?.fixed_height?.url ||
-                         gifs[0].images?.original?.url;
+            gifs[0].images?.original?.url;
 
           if (gifUrl) {
             const asset = await downloadGifAsAsset(session, gifUrl, kw.keyword, kw.timestamp);
@@ -3337,16 +3417,9 @@ async function parseBody(req) {
   return body ? JSON.parse(body) : {};
 }
 
-// Analyze transcript for B-roll opportunities using Gemini
-async function analyzeBrollOpportunities(transcript, words, totalDuration, apiKey) {
-  const ai = new GoogleGenAI({ apiKey });
-
-  const response = await ai.models.generateContent({
-    model: 'gemini-2.0-flash',
-    contents: [{
-      role: 'user',
-      parts: [{
-        text: `Analyze this video transcript and identify 3-5 key moments that would benefit from a visual B-roll image overlay. Consider:
+// Analyze transcript for B-roll opportunities using NVIDIA NIM (MiniMax)
+async function analyzeBrollOpportunities(transcript, words, totalDuration) {
+  const prompt = `Analyze this video transcript and identify 3-5 key moments that would benefit from a visual B-roll image overlay. Consider:
 - Keywords or products mentioned (e.g., "iPhone", "Claude AI", "Tesla")
 - Funny or emphatic moments
 - Important concepts being explained
@@ -3376,13 +3449,10 @@ Guidelines for prompts:
 - Avoid complex scenes - prefer single subjects with clean backgrounds
 - Images will be 1:1 square format
 
-IMPORTANT: Return ONLY valid JSON array, no markdown, no explanation.`
-      }]
-    }],
-    config: { responseMimeType: 'application/json' }
-  });
+IMPORTANT: Return ONLY valid JSON array, no markdown, no explanation.`;
 
-  const responseText = response.text || '[]';
+  const responseText = await generateNvidiaResponse(prompt, "You are a professional video content strategist.");
+  console.log(`[NVIDIA NIM] B-roll response received`);
 
   try {
     // Try to parse directly
@@ -3528,10 +3598,12 @@ async function handleGenerateBroll(req, res, sessionId) {
         const ai = new GoogleGenAI({ apiKey });
         const response = await ai.models.generateContent({
           model: 'gemini-2.0-flash',
-          contents: [{ role: 'user', parts: [
-            { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-            { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
-          ]}]
+          contents: [{
+            role: 'user', parts: [
+              { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+              { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+            ]
+          }]
         });
         const respText = response.text || '';
         try {
@@ -3599,7 +3671,7 @@ async function handleGenerateBroll(req, res, sessionId) {
       }
     }
 
-    try { unlinkSync(audioPath); } catch {}
+    try { unlinkSync(audioPath); } catch { }
 
     console.log(`[${jobId}]    Transcript: "${transcription.text.substring(0, 100)}..."`);
     console.log(`[${jobId}]    Words: ${transcription.words?.length || 0}`);
@@ -3619,69 +3691,36 @@ async function handleGenerateBroll(req, res, sessionId) {
     });
 
     // Step 3: Generate images for each opportunity
-    console.log(`[${jobId}] Step 3: Generating B-roll images...`);
+    console.log(`[${jobId}] Step 3: Generating B-roll GIFs...`);
     const brollAssets = [];
 
     for (let i = 0; i < opportunities.length; i++) {
       const opp = opportunities[i];
-      const assetId = randomUUID();
-      const imagePath = join(session.assetsDir, `${assetId}.png`);
-      const thumbPath = join(session.assetsDir, `${assetId}_thumb.jpg`);
+      console.log(`[${jobId}]    [${i + 1}/${opportunities.length}] Searching Giphy for "${opp.keyword}"...`);
 
-      console.log(`[${jobId}]    [${i + 1}/${opportunities.length}] Generating for "${opp.keyword}"...`);
+      try {
+        const gifs = await searchGiphy(opp.keyword, 1);
+        if (gifs && gifs.length > 0) {
+          const gifUrl = gifs[0].images.original.url;
+          const asset = await downloadGifAsAsset(session, gifUrl, opp.keyword, opp.timestamp);
 
-      const success = await generateImageWithGemini(opp.prompt, apiKey, imagePath);
+          asset.reason = opp.reason; // Attach reason
+          saveAssetMetadata(session);
 
-      if (success && existsSync(imagePath)) {
-        // Generate thumbnail
-        try {
-          await runFFmpeg([
-            '-y', '-i', imagePath,
-            '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
-            '-frames:v', '1',
-            thumbPath
-          ], jobId);
-        } catch (e) {
-          console.warn(`[${jobId}]    Thumbnail generation failed:`, e.message);
+          brollAssets.push({
+            assetId: asset.id,
+            keyword: opp.keyword,
+            timestamp: opp.timestamp,
+            reason: opp.reason,
+            filename: asset.filename,
+            thumbnailUrl: `/session/${sessionId}/assets/${asset.id}/thumbnail`,
+          });
+          console.log(`[${jobId}]    ✓ Giphy B-roll added: ${asset.filename}`);
+        } else {
+          console.log(`[${jobId}]    ✗ No Giphy results for "${opp.keyword}"`);
         }
-
-        const { stat } = await import('fs/promises');
-        const stats = await stat(imagePath);
-        const info = await getMediaInfo(imagePath);
-
-        // Create asset entry
-        const asset = {
-          id: assetId,
-          type: 'image',
-          filename: `broll-${opp.keyword.replace(/\s+/g, '-')}.png`,
-          path: imagePath,
-          thumbPath: existsSync(thumbPath) ? thumbPath : null,
-          duration: 3, // Default 3 seconds for B-roll images
-          size: stats.size,
-          width: info.width || 1024,
-          height: info.height || 1024,
-          createdAt: Date.now(),
-          // B-roll metadata
-          keyword: opp.keyword,
-          timestamp: opp.timestamp,
-          reason: opp.reason,
-        };
-
-        session.assets.set(assetId, asset);
-        saveAssetMetadata(session); // Persist asset metadata to disk
-
-        brollAssets.push({
-          assetId: asset.id,
-          keyword: opp.keyword,
-          timestamp: opp.timestamp,
-          reason: opp.reason,
-          filename: asset.filename,
-          thumbnailUrl: `/session/${sessionId}/assets/${asset.id}/thumbnail`,
-        });
-
-        console.log(`[${jobId}]    ✓ Generated: ${asset.filename}`);
-      } else {
-        console.log(`[${jobId}]    ✗ Failed to generate image for "${opp.keyword}"`);
+      } catch (giphyError) {
+        console.warn(`[${jobId}]    ✗ Giphy B-roll failed for "${opp.keyword}": ${giphyError.message}`);
       }
     }
 
@@ -3813,10 +3852,10 @@ async function handleGenerateAnimation(req, res, sessionId) {
     return;
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  const nvidiaKey = process.env.NVIDIA_API_KEY;
+  if (!nvidiaKey) {
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+    res.end(JSON.stringify({ error: 'NVIDIA_API_KEY not configured' }));
     return;
   }
 
@@ -3865,15 +3904,9 @@ async function handleGenerateAnimation(req, res, sessionId) {
               console.log(`[${jobId}]    "${relevantSegment.substring(0, 200)}${relevantSegment.length > 200 ? '...' : ''}"`);
             } else {
               // Use AI to identify the relevant part of the video based on the description
-              console.log(`[${jobId}] Using AI to identify relevant video segment...`);
+              console.log(`[${jobId}] Using AI (MiniMax) to identify relevant video segment...`);
 
-              const ai = new GoogleGenAI({ apiKey });
-              const segmentResult = await ai.models.generateContent({
-                model: 'gemini-2.0-flash',
-                contents: [{
-                  role: 'user',
-                  parts: [{
-                    text: `Given this video transcript and an animation request, identify the most relevant time segment.
+              const segmentPrompt = `Given this video transcript and an animation request, identify the most relevant time segment.
 
 VIDEO TRANSCRIPT (with word timestamps):
 ${transcription.words?.slice(0, 200).map(w => `[${w.start.toFixed(1)}s] ${w.text}`).join(' ') || transcription.text.substring(0, 2000)}
@@ -3896,13 +3929,11 @@ Return ONLY JSON (no markdown):
 If the animation seems to be for the intro (beginning), use startTime: 0.
 If it's for the outro (ending), use times near the end.
 If it's about a specific topic mentioned in the transcript, find where that topic is discussed.
-If unclear or general, use the middle third of the video.`
-                  }]
-                }],
-              });
+If unclear or general, use the middle third of the video.`;
+
+              const segmentText = await generateNvidiaResponse(segmentPrompt, "You are a specialized video analysis assistant.");
 
               try {
-                const segmentText = segmentResult.candidates[0].content.parts[0].text;
                 const cleanedSegment = segmentText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
                 const segmentData = JSON.parse(cleanedSegment);
 
@@ -3935,7 +3966,7 @@ ${timeRangeNote}
 
 IMPORTANT: The animation content should be relevant to and inspired by this video context. Use specific terms, concepts, and themes from the transcript to make the animation feel connected to the video content.`;
 
-              console.log(`[${jobId}] 🎯 Transcript context built for Gemini (${relevantSegment.length} chars)`);
+              console.log(`[${jobId}] 🎯 Transcript context built for NVIDIA NIM (${relevantSegment.length} chars)`);
             }
           }
         } catch (transcriptError) {
@@ -3999,12 +4030,10 @@ CRITICAL REQUIREMENTS:
       }
     }
 
-    // Step 1: Use Gemini to generate scene data
-    console.log(`[${jobId}] Generating scenes with Gemini...`);
+    // Step 1: Use NVIDIA NIM (MiniMax) to generate scene data
+    console.log(`[${jobId}] Generating scenes with NVIDIA NIM (MiniMax)...`);
 
-    const ai = new GoogleGenAI({ apiKey });
-
-    const prompt = `You are a motion graphics designer. Create a JSON scene structure for an animated video based on this description:
+    const animationPrompt = `You are a motion graphics designer. Create a JSON scene structure for an animated video based on this description:
 
 "${description}"
 ${transcriptContext}${attachedAssetsContext}
@@ -4178,14 +4207,10 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
 - For product shots, use "phone-frame" or "circle" mediaStyle
 - For videos, consider using slow-mo (videoPlaybackRate: 0.5) for dramatic moments` : ''}`;
 
-    const result = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    });
+    const responseText = await generateNvidiaResponse(animationPrompt, "You are a professional motion graphics designer.");
 
     let sceneData;
     try {
-      const responseText = result.candidates[0].content.parts[0].text;
       // Clean up response - remove markdown code blocks if present
       const cleanedResponse = responseText
         .replace(/```json\n?/g, '')
@@ -4193,7 +4218,7 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
         .trim();
       sceneData = JSON.parse(cleanedResponse);
     } catch (parseError) {
-      console.error(`[${jobId}] Failed to parse Gemini response:`, parseError);
+      console.error(`[${jobId}] Failed to parse NVIDIA NIM response:`, parseError);
       throw new Error('Failed to parse AI-generated scene data');
     }
 
@@ -4654,12 +4679,17 @@ To include an asset in a scene, use:
 }`;
     }
 
-    // Use Gemini to modify the scene data
-    console.log(`[${jobId}] Modifying scenes with Gemini...`);
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
+    if (!nvidiaKey) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'NVIDIA_API_KEY not configured' }));
+      return;
+    }
 
-    const ai = new GoogleGenAI({ apiKey });
+    // Use NVIDIA NIM (MiniMax) to modify the scene data
+    console.log(`[${jobId}] Modifying scenes with NVIDIA NIM (MiniMax)...`);
 
-    const prompt = `You are editing an EXISTING Remotion animation. The user wants to make a SPECIFIC change.
+    const animationPrompt = `You are editing an EXISTING Remotion animation. The user wants to make a SPECIFIC change.
 
 ## YOUR TASK
 Make ONLY the change the user requested. Do NOT change anything else.
@@ -4773,22 +4803,18 @@ When transcript context is available, you can use it to:
 
 Return ONLY the complete JSON structure with your minimal change applied. No markdown, no explanation.`;
 
-    // Use Gemini 3.0 Pro for better instruction following on edits
-    const result = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    });
+    // Use NVIDIA NIM (MiniMax) instead of Gemini
+    const responseText = await generateNvidiaResponse(animationPrompt, "You are a professional video editor specializing in kinetic typography and animation.");
 
     let newSceneData;
     try {
-      const responseText = result.candidates[0].content.parts[0].text;
       const cleanedResponse = responseText
         .replace(/```json\n?/g, '')
         .replace(/```\n?/g, '')
         .trim();
       newSceneData = JSON.parse(cleanedResponse);
     } catch (parseError) {
-      console.error(`[${jobId}] Failed to parse Gemini response:`, parseError);
+      console.error(`[${jobId}] Failed to parse NVIDIA NIM response:`, parseError);
       throw new Error('Failed to parse AI-modified scene data');
     }
 
@@ -4866,7 +4892,7 @@ Return ONLY the complete JSON structure with your minimal change applied. No mar
     // Clean up props file
     try {
       unlinkSync(propsPath);
-    } catch (e) {}
+    } catch (e) { }
 
     const { stat } = await import('fs/promises');
     const stats = await stat(outputPath);
@@ -4933,6 +4959,7 @@ async function handleGenerateImage(req, res, sessionId) {
   }
 
   const geminiApiKey = process.env.GEMINI_API_KEY;
+  const nvidiaApiKey = process.env.NVIDIA_API_KEY;
 
   try {
     const body = await parseBody(req);
@@ -4954,68 +4981,34 @@ async function handleGenerateImage(req, res, sessionId) {
     console.log(`[${jobId}] User prompt: ${prompt}`);
     console.log(`[${jobId}] Aspect ratio: ${aspectRatio}, Resolution: ${resolution}`);
 
-    // Enhance prompt using Gemini for better image generation results
+    // Enhance prompt using NVIDIA NIM (MiniMax) for better image generation results
     let enhancedPrompt = prompt;
-    if (geminiApiKey) {
+    if (nvidiaApiKey) {
       try {
-        console.log(`[${jobId}] Enhancing prompt with Picasso AI...`);
-        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
-
+        console.log(`[${jobId}] Enhancing prompt with Picasso AI (NVIDIA NIM)...`);
         const systemPrompt = `You are Picasso, an expert AI prompt engineer specializing in image generation. Your role is to transform simple user requests into detailed, visually compelling prompts that produce stunning images.
 
 ## Your Expertise
 - Deep knowledge of photography, cinematography, art styles, and visual composition
-- Understanding of lighting (golden hour, studio, dramatic, soft, etc.)
-- Mastery of artistic movements (impressionism, surrealism, photorealism, etc.)
-- Knowledge of camera perspectives, lenses, and depth of field
-- Understanding of color theory and mood creation
-
-## Prompt Enhancement Guidelines
-
-1. **Visual Details**: Add specific visual elements - textures, materials, colors, patterns
-2. **Lighting**: Specify lighting conditions that enhance the mood (soft diffused light, dramatic rim lighting, golden hour glow, neon accents)
-3. **Composition**: Include framing, perspective, and focal points (close-up, wide shot, bird's eye view, rule of thirds)
-4. **Style**: Add artistic style when appropriate (cinematic, photorealistic, digital art, oil painting, etc.)
-5. **Atmosphere**: Include mood and atmosphere descriptors (ethereal, moody, vibrant, serene, dynamic)
-6. **Quality Markers**: Add quality enhancers (highly detailed, 8K, professional photography, masterpiece)
+- Understanding of lighting, artistic movements, camera perspectives, and color theory
 
 ## Rules
 - Keep the enhanced prompt under 200 words
 - Preserve the user's core intent - don't change WHAT they want, enhance HOW it looks
 - Don't add text/words to appear in the image unless requested
-- Output ONLY the enhanced prompt, no explanations or markdown
-- Make every image feel premium, professional, and visually striking
+- Output ONLY the enhanced prompt, no explanations or markdown`;
 
-## Examples
+        const enhanced = await generateNvidiaResponse(`Enhance this image prompt:\n\n"${prompt}"`, systemPrompt);
 
-User: "a cat sitting on a windowsill"
-Enhanced: "A majestic tabby cat lounging on a sun-drenched windowsill, soft golden hour light streaming through sheer curtains, dust particles floating in the warm light beams, cozy interior with potted plants, shallow depth of field, photorealistic, intimate portrait style, warm amber and cream color palette, highly detailed fur texture"
-
-User: "cyberpunk city"
-Enhanced: "Sprawling cyberpunk metropolis at night, towering neon-lit skyscrapers piercing through low-hanging smog, holographic advertisements reflecting off rain-slicked streets, flying vehicles with glowing thrusters, diverse crowd of augmented humans, pink and cyan neon color scheme, cinematic wide-angle shot, blade runner aesthetic, volumetric fog, raytraced reflections, 8K ultra detailed"
-
-User: "a peaceful forest"
-Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal morning mist weaving between massive trunks, soft dappled sunlight filtering through the dense canopy, ferns and wildflowers carpeting the forest floor, a gentle stream with crystal-clear water, mystical and serene atmosphere, nature photography style, rich greens and earth tones, depth and scale, photorealistic, National Geographic quality"`;
-
-        const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: [{
-            role: 'user',
-            parts: [{ text: `Enhance this image prompt:\n\n"${prompt}"` }]
-          }],
-          systemInstruction: systemPrompt,
-        });
-
-        const enhanced = result.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
         if (enhanced && enhanced.length > 10) {
-          enhancedPrompt = enhanced;
+          enhancedPrompt = enhanced.trim();
           console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
         }
       } catch (enhanceError) {
         console.warn(`[${jobId}] Prompt enhancement failed, using original:`, enhanceError.message);
       }
     } else {
-      console.log(`[${jobId}] No GEMINI_API_KEY, using original prompt`);
+      console.log(`[${jobId}] No NVIDIA_API_KEY, using original prompt`);
     }
 
     // Call fal.ai nano-banana-pro API with enhanced prompt
@@ -5170,52 +5163,34 @@ async function handleGenerateVideo(req, res, sessionId) {
     console.log(`[${jobId}] Source image: ${imageAsset.filename}`);
     console.log(`[${jobId}] Duration: ${duration}s`);
 
-    // Enhance prompt using Gemini for better video generation
-    let enhancedPrompt = prompt;
-    if (geminiApiKey) {
-      try {
-        console.log(`[${jobId}] Enhancing prompt with DiCaprio AI...`);
-        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
 
+    // Enhance prompt using NVIDIA NIM (MiniMax) for better video generation
+    let enhancedPrompt = prompt;
+    if (nvidiaKey) {
+      try {
+        console.log(`[${jobId}] Enhancing prompt with DiCaprio AI (NVIDIA NIM)...`);
         const systemPrompt = `You are DiCaprio, an expert AI prompt engineer specializing in image-to-video generation. Your role is to transform simple motion requests into detailed, cinematic prompts that produce stunning videos.
 
 ## Your Expertise
 - Deep knowledge of cinematography, camera movements, and film techniques
 - Understanding of timing, pacing, and motion dynamics
 - Mastery of visual storytelling through movement
-- Knowledge of video generation model capabilities
-
-## Prompt Enhancement Guidelines
-
-1. **Camera Movement**: Be specific about camera motion (dolly, pan, tilt, zoom, crane, tracking, handheld)
-2. **Motion Direction**: Specify direction and speed (slow zoom in, gentle pan left, dynamic push forward)
-3. **Subject Motion**: Describe how elements in the scene should move (hair flowing, leaves rustling, water rippling)
-4. **Atmosphere**: Include atmospheric effects (light rays moving, dust particles, fog drifting)
-5. **Timing**: Use terms like "gradual", "sudden", "rhythmic", "smooth", "cinematic"
 
 ## Response Format
-Return ONLY the enhanced prompt text. No explanations, no quotes, no markdown.
+Return ONLY the enhanced prompt text. No explanations, no quotes, no markdown.`;
 
-## Example Input -> Output
-Input: "make it move"
-Output: "Cinematic slow zoom in with subtle parallax movement, gentle ambient motion with soft light rays drifting through the scene, atmospheric particles floating in the air, smooth and dreamlike camera drift"
+        const enhanced = await generateNvidiaResponse(`Enhance this video motion prompt: "${prompt}"`, systemPrompt);
 
-Input: "zoom out"
-Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling back to reveal the full scene, subtle atmospheric haze and soft light flares, smooth dolly movement with slight vertical lift"`;
-
-        const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: [
-            { role: 'user', parts: [{ text: systemPrompt }] },
-            { role: 'user', parts: [{ text: `Enhance this video motion prompt: "${prompt}"` }] }
-          ],
-        });
-
-        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
-        console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
+        if (enhanced && enhanced.length > 5) {
+          enhancedPrompt = enhanced.trim();
+          console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
+        }
       } catch (e) {
         console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
       }
+    } else {
+      console.log(`[${jobId}] No NVIDIA_API_KEY, using original prompt`);
     }
 
     // Upload image to fal.ai storage to get a URL (handles large files)
@@ -5397,43 +5372,28 @@ async function handleRestyleVideo(req, res, sessionId) {
     }
 
     const jobId = sessionId.substring(0, 8);
-    console.log(`\n[${jobId}] === DICAPRIO: RESTYLE VIDEO ===`);
-    console.log(`[${jobId}] User prompt: ${prompt}`);
-    console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
 
-    // Enhance prompt using Gemini for better style transfer
+    // Enhance prompt using NVIDIA NIM (MiniMax) for better video style transfer
     let enhancedPrompt = prompt;
-    if (geminiApiKey) {
+    if (nvidiaKey) {
       try {
-        console.log(`[${jobId}] Enhancing style prompt with AI...`);
-        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+        console.log(`[${jobId}] Enhancing style prompt with DiCaprio AI (NVIDIA NIM)...`);
+        const systemPrompt = `You are an expert at writing prompts for AI video style transfer. Transform this simple style request into a detailed, cinematic prompt that will produce stunning results.
 
-        const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: [{
-            role: 'user',
-            parts: [{
-              text: `You are an expert at writing prompts for AI video style transfer. Transform this simple style request into a detailed, cinematic prompt that will produce stunning results.
+Write a detailed prompt describing the visual style (color, texture, lighting, aesthetic). Return ONLY the enhanced prompt, no explanations.`;
 
-User request: "${prompt}"
+        const enhanced = await generateNvidiaResponse(`Enhance this style request:\n\n"${prompt}"`, systemPrompt);
 
-Write a detailed prompt describing the visual style. Include:
-- Color grading and mood
-- Texture and grain quality
-- Lighting style
-- Overall aesthetic
-- Any specific visual effects
-
-Return ONLY the enhanced prompt, no explanations.`
-            }]
-          }],
-        });
-
-        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
-        console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
+        if (enhanced && enhanced.length > 5) {
+          enhancedPrompt = enhanced.trim();
+          console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
+        }
       } catch (e) {
         console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
       }
+    } else {
+      console.log(`[${jobId}] No NVIDIA_API_KEY, using original prompt`);
     }
 
     // Compress video for upload (fal.ai has size limits)
@@ -5464,7 +5424,7 @@ Return ONLY the enhanced prompt, no explanations.`
     console.log(`[${jobId}] Video uploaded: ${uploadedVideoUrl.substring(0, 50)}...`);
 
     // Clean up compressed file
-    try { unlinkSync(compressedPath); } catch (e) {}
+    try { unlinkSync(compressedPath); } catch (e) { }
 
     console.log(`[${jobId}] Calling fal.ai LTX-2 video-to-video...`);
 
@@ -5649,7 +5609,7 @@ async function handleRemoveVideoBg(req, res, sessionId) {
     console.log(`[${jobId}] Video uploaded: ${uploadedVideoUrl.substring(0, 50)}...`);
 
     // Clean up compressed file
-    try { unlinkSync(compressedPath); } catch (e) {}
+    try { unlinkSync(compressedPath); } catch (e) { }
 
     console.log(`[${jobId}] Calling fal.ai Bria video background removal...`);
 
@@ -5814,18 +5774,17 @@ async function handleGenerateBatchAnimations(req, res, sessionId) {
       return;
     }
 
-    console.log(`[${jobId}] Transcription: ${transcription.text.substring(0, 200)}...`);
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
+    if (!nvidiaKey) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'NVIDIA_API_KEY not configured' }));
+      return;
+    }
 
-    // Step 2: Use Gemini to plan animations across the video
-    console.log(`[${jobId}] Step 2: Planning ${count} animations with AI...`);
+    // Step 2: Use NVIDIA NIM (MiniMax) to plan animations across the video
+    console.log(`[${jobId}] Step 2: Planning ${count} animations with NVIDIA NIM (MiniMax)...`);
 
-    const ai = new GoogleGenAI({ apiKey });
-    const planResult = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{
-        role: 'user',
-        parts: [{
-          text: `You are a video editor planning motion graphics animations for a video. Analyze this transcript and plan exactly ${count} animations that would enhance the video.
+    const planPrompt = `You are a video editor planning motion graphics animations for a video. Analyze this transcript and plan exactly ${count} animations that would enhance the video.
 
 VIDEO TRANSCRIPT:
 "${transcription.text}"
@@ -5837,7 +5796,7 @@ ${transcription.words?.slice(0, 100).map(w => `[${w.start.toFixed(1)}s] ${w.text
 
 Plan exactly ${count} animations. Each should:
 1. Be placed at a strategic moment in the video (intro, key points, transitions, outro)
-2. Have a specific purpose (introduce topic, highlight key point, transition, call-to-action, etc.)
+2. Have a specific purpose
 3. Be relevant to the content being discussed at that timestamp
 
 Return ONLY valid JSON (no markdown):
@@ -5845,28 +5804,24 @@ Return ONLY valid JSON (no markdown):
   "animations": [
     {
       "type": "intro" | "highlight" | "transition" | "callout" | "outro",
-      "startTime": <seconds where animation should appear>,
-      "duration": <animation duration in seconds, typically 3-5>,
-      "title": "<short title for the animation>",
-      "description": "<detailed description of what the animation should show, including specific text, colors, style>",
-      "relevantContent": "<what the video is discussing at this point>"
+      "startTime": <seconds>,
+      "duration": <seconds, typically 3-5>,
+      "title": "<short title>",
+      "description": "<detailed description>",
+      "relevantContent": "<what the video is discussing>"
     }
   ]
 }
 
 Guidelines:
-- First animation should typically be an intro (startTime: 0)
-- Last animation could be an outro or call-to-action
-- Space animations throughout the video, not clustered together
-- Each animation should enhance understanding or engagement
-- Be specific about visual style, colors, and text content`
-        }]
-      }],
-    });
+- Space animations throughout the video
+- First animation is usually intro (0s)
+- Be specific about visual style and colors for each animation`;
+
+    const planText = await generateNvidiaResponse(planPrompt, "You are a professional video content director and editor.");
 
     let animationPlan;
     try {
-      const planText = planResult.candidates[0].content.parts[0].text;
       const cleanedPlan = planText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       animationPlan = JSON.parse(cleanedPlan);
     } catch (parseError) {
@@ -6023,7 +5978,7 @@ Make it visually engaging with good color choices. Use 2-4 scenes for variety.`
       }
 
       // Clean up props file
-      try { unlinkSync(propsPath); } catch (e) {}
+      try { unlinkSync(propsPath); } catch (e) { }
 
       const { stat } = await import('fs/promises');
       const stats = await stat(outputPath);
@@ -6242,12 +6197,20 @@ async function handleAnalyzeForAnimation(req, res, sessionId) {
     console.log(`[${jobId}] Transcription complete: ${transcription.text.substring(0, 100)}...`);
 
     // Clean up audio file
-    try { unlinkSync(audioPath); } catch (e) {}
+    try { unlinkSync(audioPath); } catch (e) { }
 
     // Step 2: Generate animation concept (scenes) without rendering
     console.log(`[${jobId}] Step 2: Generating animation concept...`);
 
-    const genAI = new GoogleGenAI({ apiKey });
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
+    if (!nvidiaKey) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'NVIDIA_API_KEY not configured' }));
+      return;
+    }
+
+    // Step 2: Use NVIDIA NIM (MiniMax) to generate animation concept (scenes)
+    console.log(`[${jobId}] Step 2: Generating animation concept with NVIDIA NIM (MiniMax)...`);
 
     const typePrompts = {
       intro: `Create an engaging INTRO animation that hooks viewers and introduces the video topic.
@@ -6279,7 +6242,7 @@ The highlight should:
 
     // Build time context for the prompt
     const timeContext = hasTimeRange
-      ? `\nNOTE: This transcript is from a SPECIFIC SEGMENT of the video (${segmentStart.toFixed(1)}s - ${endTime.toFixed(1)}s, duration: ${segmentDuration.toFixed(1)}s). Create an animation that relates ONLY to what is being discussed in this segment, not the entire video.`
+      ? `\nNOTE: This transcript is from a SPECIFIC SEGMENT of the video (${segmentStart.toFixed(1)}s - ${endTime.toFixed(1)}s, duration: ${segmentDuration.toFixed(1)}s). Create an animation that relates ONLY to what is being discussed in this segment.`
       : '';
 
     const scenePrompt = `You are a motion graphics designer. Analyze this video transcript and create a contextual ${type} animation concept.
@@ -6298,52 +6261,39 @@ Based on the video content above, return ONLY valid JSON (no markdown) with this
     {
       "id": "unique-id",
       "type": "title" | "steps" | "features" | "stats" | "text" | "transition" | "gif" | "emoji",
-      "duration": <frames at 30fps>,
+      "duration": <frames>,
       "content": {
-        "title": "text derived from video content",
+        "title": "text from video content",
         "subtitle": "optional",
         "items": [{"icon": "emoji", "label": "text", "description": "optional"}],
-        "stats": [{"value": "number", "label": "text", "numericValue": <integer for counting>}],
-        "color": "#hex accent color",
-        "backgroundColor": "#hex or null for transparent",
-        // For gif scenes - use GIPHY search:
-        "gifSearch": "keyword to search for GIF",
+        "stats": [{"value": "number", "label": "text", "numericValue": <number>}],
+        "color": "#hex",
+        "backgroundColor": "#hex or null",
+        "gifSearch": "keyword",
         "gifLayout": "fullscreen" | "scattered",
-        // For emoji scenes:
         "emojis": [{"emoji": "🔥", "x": 50, "y": 50, "scale": 0.2, "animation": "bounce"}]
       }
     }
   ],
   "backgroundColor": "#0a0a0a",
-  "totalDuration": <sum of scene durations>,
-  "contentSummary": "brief description of what the video is about",
-  "keyTopics": ["topic1", "topic2", "topic3"]
+  "totalDuration": <sum>,
+  "contentSummary": "summary",
+  "keyTopics": ["topic1", "topic2"]
 }
 
-Scene type notes:
-- "gif": Use "gifSearch" to search GIPHY for GIFs (e.g., "mind blown", "celebration", "thumbs up")
-- "emoji": Animated emoji scene with animations (pop, bounce, float, pulse)
-- "stats": Use numericValue for counting animation (must be a NUMBER)
+IMPORTANT: Use specific terms from the transcript. Add GIFs for energy/reaction when appropriate!`;
 
-IMPORTANT: The animation content should directly relate to the video's actual topic and message.
-Use specific terms, concepts, and themes from the transcript.
-Feel free to add a GIF scene for reactions or emphasis when appropriate!`;
-
-    const sceneResult = await genAI.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{ role: 'user', parts: [{ text: scenePrompt }] }],
-    });
+    const responseText = await generateNvidiaResponse(scenePrompt, "You are a professional motion graphics designer and director.");
 
     let sceneData;
     try {
-      const responseText = sceneResult.candidates[0].content.parts[0].text;
       const cleanedResponse = responseText
         .replace(/```json\n?/g, '')
         .replace(/```\n?/g, '')
         .trim();
       sceneData = JSON.parse(cleanedResponse);
     } catch (parseError) {
-      console.error(`[${jobId}] Failed to parse Gemini response:`, parseError);
+      console.error(`[${jobId}] Failed to parse NVIDIA NIM response:`, parseError);
       throw new Error('Failed to parse AI-generated scene data');
     }
 
@@ -6574,7 +6524,7 @@ async function handleRenderFromConcept(req, res, sessionId) {
     ], jobId);
 
     // Clean up props file
-    try { unlinkSync(propsPath); } catch (e) {}
+    try { unlinkSync(propsPath); } catch (e) { }
 
     const { stat } = await import('fs/promises');
     const stats = await stat(outputPath);
@@ -6677,125 +6627,47 @@ async function handleGenerateTranscriptAnimation(req, res, sessionId) {
       audioPath
     ], jobId);
 
-    // Check transcription method
-    const hasLocalWhisper = await checkLocalWhisper();
-    const openaiKey = process.env.OPENAI_API_KEY;
-
-    // Helper for Gemini fallback
-    const transcribeWithGeminiForAnimation = async () => {
-      console.log(`[${jobId}]    Using Gemini for transcription...`);
-      const audioBuffer = readFileSync(audioPath);
-      const audioBase64 = audioBuffer.toString('base64');
-      const ai = new GoogleGenAI({ apiKey });
-      const geminiResponse = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: [{ role: 'user', parts: [
-          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-          { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
-        ]}]
-      });
-      const respText = geminiResponse.text || '';
-      try {
-        return JSON.parse(respText);
-      } catch {
-        const match = respText.match(/\{[\s\S]*\}/);
-        return match ? JSON.parse(match[0]) : { text: respText, words: [] };
-      }
-    };
-
-    let transcription;
-    if (hasLocalWhisper) {
-      try {
-        console.log(`[${jobId}]    Using local Whisper...`);
-        transcription = await runLocalWhisper(audioPath, jobId);
-      } catch (whisperError) {
-        console.log(`[${jobId}]    Local Whisper failed: ${whisperError.message}`);
-        console.log(`[${jobId}]    Falling back to Gemini...`);
-        transcription = await transcribeWithGeminiForAnimation();
-      }
-    } else if (openaiKey) {
-      console.log(`[${jobId}]    Using OpenAI Whisper API...`);
-      const audioBuffer = readFileSync(audioPath);
-      const FormData = (await import('formdata-node')).FormData;
-      const { Blob } = await import('buffer');
-
-      const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
-      formData.append('model', 'whisper-1');
-      formData.append('response_format', 'verbose_json');
-      formData.append('timestamp_granularities[]', 'word');
-
-      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${openaiKey}` },
-        body: formData,
-      });
-
-      if (!whisperResponse.ok) {
-        throw new Error(`Whisper API error: ${whisperResponse.status}`);
-      }
-
-      const whisperResult = await whisperResponse.json();
-      transcription = {
-        text: whisperResult.text || '',
-        words: (whisperResult.words || []).map(w => ({
-          text: w.word || '',
-          start: w.start || 0,
-          end: w.end || 0,
-        }))
-      };
-    } else {
-      transcription = await transcribeWithGeminiForAnimation();
-    }
-
-    try { unlinkSync(audioPath); } catch {}
+    const transcription = await internalTranscribe(session, videoAsset, totalDuration, jobId);
+    try { unlinkSync(audioPath); } catch { }
 
     console.log(`[${jobId}]    Transcript: "${transcription.text.substring(0, 100)}..."`);
     console.log(`[${jobId}]    Words: ${transcription.words?.length || 0}`);
 
-    // Step 2: Use Gemini to identify key phrases for animation
-    console.log(`[${jobId}] Step 2: Identifying key phrases...`);
-    const ai = new GoogleGenAI({ apiKey });
+    // Step 2: Use NVIDIA NIM (MiniMax) to identify key phrases for animation
+    console.log(`[${jobId}] Step 2: Identifying key phrases with NVIDIA NIM (MiniMax)...`);
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
+    if (!nvidiaKey) {
+      console.warn(`[${jobId}] NVIDIA_API_KEY not configured, skipping key phrase identification`);
+      // Fallback below will handle it
+    } else {
+      const analysisPrompt = `Analyze this video transcript and identify 5-8 KEY PHRASES for kinetic typography animations.
+- Impactful statements, keywords, emotional moments, key points
+- Transcript: "${transcription.text}"
+- Word timestamps: ${JSON.stringify(transcription.words?.slice(0, 100) || [])}
+- Total duration: ${totalDuration}s
 
-    const analysisPrompt = `Analyze this video transcript and identify 5-8 KEY PHRASES that would make great kinetic typography animations. These should be:
-- Important or impactful statements
-- Keywords or product names
-- Emotional or emphatic moments
-- Key points the speaker is making
-
-Transcript: "${transcription.text}"
-
-Word timestamps: ${JSON.stringify(transcription.words?.slice(0, 100) || [])}
-(Total duration: ${totalDuration}s)
-
-Return JSON array of phrases to animate:
+Return JSON array of objects:
 [
   {
-    "phrase": "the exact phrase from transcript",
+    "phrase": "phrase from transcript",
     "startTime": 1.5,
     "endTime": 3.2,
     "emphasis": "high|medium|low",
     "style": "bold|explosive|subtle|typewriter",
-    "reason": "why this phrase is important"
+    "reason": "reasoning"
   }
-]
+]`;
 
-Pick phrases that are spread throughout the video. Each phrase should be 2-6 words.`;
+      const analysisResponseText = await generateNvidiaResponse(analysisPrompt, "You are a professional video editor and typography designer.");
 
-    const analysisResponse = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{ role: 'user', parts: [{ text: analysisPrompt }] }]
-    });
-
-    let keyPhrases = [];
-    try {
-      const respText = analysisResponse.text || '';
-      const jsonMatch = respText.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        keyPhrases = JSON.parse(jsonMatch[0]);
+      try {
+        const jsonMatch = analysisResponseText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          keyPhrases = JSON.parse(jsonMatch[0]);
+        }
+      } catch (e) {
+        console.error(`[${jobId}] Failed to parse key phrases from NVIDIA NIM:`, e.message);
       }
-    } catch (e) {
-      console.error(`[${jobId}] Failed to parse key phrases:`, e.message);
     }
 
     if (keyPhrases.length === 0) {
@@ -6921,7 +6793,7 @@ Pick phrases that are spread throughout the video. Each phrase should be 2-6 wor
       thumbPath
     ], jobId);
 
-    try { unlinkSync(propsPath); } catch {}
+    try { unlinkSync(propsPath); } catch { }
 
     const { stat } = await import('fs/promises');
     const stats = await stat(outputPath);
@@ -6948,6 +6820,8 @@ Pick phrases that are spread throughout the video. Each phrase should be 2-6 wor
 
     session.assets.set(assetId, asset);
     saveAssetMetadata(session); // Persist AI-generated flag to disk
+
+    logSessionActivity(session, 'generate-transcript-animation', { assetId, phrases: keyPhrases.length });
 
     console.log(`[${jobId}] Transcript animation created: ${assetId}`);
     console.log(`[${jobId}] === TRANSCRIPT ANIMATION COMPLETE ===\n`);
@@ -7114,12 +6988,20 @@ async function handleGenerateContextualAnimation(req, res, sessionId) {
     console.log(`[${jobId}] Transcription complete: ${transcription.text.substring(0, 100)}...`);
 
     // Clean up audio file
-    try { unlinkSync(audioPath); } catch (e) {}
+    try { unlinkSync(audioPath); } catch (e) { }
 
     // Step 2: Analyze content and generate contextual scene data
     console.log(`[${jobId}] Step 2: Analyzing content and generating scenes...`);
 
-    const genAI = new GoogleGenAI({ apiKey });
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
+    if (!nvidiaKey) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'NVIDIA_API_KEY not configured' }));
+      return;
+    }
+
+    // Step 2: Analyze content and generate contextual scene data with NVIDIA NIM
+    console.log(`[${jobId}] Step 2: Analyzing content and generating scenes with NVIDIA NIM (MiniMax)...`);
 
     const typePrompts = {
       intro: `Create an engaging INTRO animation that hooks viewers and introduces the video topic.
@@ -7164,40 +7046,35 @@ Based on the video content above, return ONLY valid JSON (no markdown) with this
     {
       "id": "unique-id",
       "type": "title" | "steps" | "features" | "stats" | "text" | "transition",
-      "duration": <frames at 30fps>,
+      "duration": <frames>,
       "content": {
-        "title": "text derived from video content",
+        "title": "text from video",
         "subtitle": "optional",
         "items": [{"icon": "emoji", "label": "text", "description": "optional"}],
         "stats": [{"value": "number", "label": "text"}],
-        "color": "#hex accent color",
-        "backgroundColor": "#hex or null for transparent"
+        "color": "#hex",
+        "backgroundColor": "#hex or null"
       }
     }
   ],
   "backgroundColor": "#0a0a0a",
-  "totalDuration": <sum of scene durations>,
-  "contentSummary": "brief description of what the video is about"
+  "totalDuration": <sum>,
+  "contentSummary": "summary"
 }
 
-IMPORTANT: The animation content should directly relate to the video's actual topic and message.
-Use specific terms, concepts, and themes from the transcript.`;
+IMPORTANT: Use specific terms from the transcript.`;
 
-    const sceneResult = await genAI.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{ role: 'user', parts: [{ text: scenePrompt }] }],
-    });
+    const responseText = await generateNvidiaResponse(scenePrompt, "You are a professional motion graphics designer.");
 
     let sceneData;
     try {
-      const responseText = sceneResult.candidates[0].content.parts[0].text;
       const cleanedResponse = responseText
         .replace(/```json\n?/g, '')
         .replace(/```\n?/g, '')
         .trim();
       sceneData = JSON.parse(cleanedResponse);
     } catch (parseError) {
-      console.error(`[${jobId}] Failed to parse Gemini response:`, parseError);
+      console.error(`[${jobId}] Failed to parse NVIDIA NIM response:`, parseError);
       throw new Error('Failed to parse AI-generated scene data');
     }
 
@@ -7282,7 +7159,7 @@ Use specific terms, concepts, and themes from the transcript.`;
     ], jobId);
 
     // Clean up
-    try { unlinkSync(propsPath); } catch (e) {}
+    try { unlinkSync(propsPath); } catch (e) { }
 
     const { stat } = await import('fs/promises');
     const stats = await stat(outputPath);
@@ -7419,7 +7296,7 @@ async function handleExtractAudio(req, res, sessionId) {
     let audioDuration = videoAsset.duration;
     try {
       const durationStr = execSync(
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+        `"${FFPROBE_CMD}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
         { encoding: 'utf-8' }
       ).trim();
       audioDuration = parseFloat(durationStr) || videoAsset.duration;
@@ -7577,7 +7454,7 @@ async function handleProcessAsset(req, res, sessionId) {
     let duration = asset.duration;
     try {
       const durationStr = execSync(
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPath}"`,
+        `"${FFPROBE_CMD}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPath}"`,
         { encoding: 'utf-8' }
       ).trim();
       duration = parseFloat(durationStr) || asset.duration;
@@ -7769,6 +7646,10 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'remove-video-bg') {
       await handleRemoveVideoBg(req, res, sessionId);
     }
+    // Export session as reusable skill
+    else if (req.method === 'POST' && action === 'export-skill') {
+      await handleExportSkill(req, res, sessionId);
+    }
     // GIPHY search endpoints
     else if (req.method === 'GET' && action === 'giphy/search') {
       await handleGiphySearch(req, res, sessionId, url);
@@ -7800,16 +7681,363 @@ const server = http.createServer(async (req, res) => {
     await handleProcess(req, res);
   } else if (req.method === 'POST' && path === '/remove-dead-air') {
     await handleRemoveDeadAir(req, res);
-  } else if (req.method === 'POST' && path === '/generate-chapters') {
-    await handleGenerateChapters(req, res);
+  } else if (req.method === 'POST' && path === '/autonomous/process') {
+    await handleAutonomousProcess(req, res);
+  } else if (req.method === 'POST' && path === '/autonomous/select-skill') {
+    await handleAutonomousSelectSkill(req, res);
   } else if (req.method === 'GET' && path === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', ffmpeg: 'native', sessions: sessions.size }));
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+    });
+    res.end(JSON.stringify({ status: 'ok', ffmpeg: 'native', platform: process.platform, sessions: sessions.size }));
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
   }
 });
+
+/**
+ * Summarize session activity and export as a new repository skill
+ */
+async function handleExportSkill(req, res, sessionId) {
+  const session = getSession(sessionId);
+  const nvidiaKey = process.env.NVIDIA_API_KEY;
+
+  if (!session || !nvidiaKey) {
+    res.writeHead(session ? 500 : 404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: !session ? 'Session not found' : 'NVIDIA_API_KEY not set' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const { name = `skill-${sessionId.substring(0, 6)}`, description } = body;
+
+    const jobId = randomUUID();
+    console.log(`\n[${jobId}] === EXPORTING SKILL: ${name} ===`);
+
+    const synthesisPrompt = `You are a Senior Video Tools Architect. Your task is to extract a reusable "Edit Skill" from a user's session history.
+    
+SESSION NAME: ${session.name}
+ACTION HISTORY:
+${JSON.stringify(session.action_history, null, 2)}
+
+PROJECT STATE (FINAL):
+${JSON.stringify({ clips: session.project.clips, tracks: session.project.tracks }, null, 2)}
+
+USER-PROVIDED DESCRIPTION: ${description || 'N/A'}
+
+Based on the actions taken, describe this editing pattern in a way that an autonomous agent can construct a specialized prompt for it.
+
+Return ONLY valid Markdown for a SKILL.md file with standard skill structure (name, description, workflow, customization questions).`;
+
+    const skillContent = await generateNvidiaResponse(synthesisPrompt, "You are a senior video tools architect.");
+
+    // Create the skill directory
+    const skillsDir = join(process.cwd(), '.agents', 'skills', name);
+    if (!existsSync(skillsDir)) {
+      mkdirSync(skillsDir, { recursive: true });
+    }
+
+    writeFileSync(join(skillsDir, 'SKILL.md'), skillContent);
+    console.log(`[${jobId}] Skill saved to ${skillsDir}`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      path: `.agents/skills/${name}/SKILL.md`,
+      message: 'Skill extracted and saved to repository.'
+    }));
+
+  } catch (error) {
+    console.error('Export skill error:', error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+/**
+ * Skill Selection Engine
+ */
+async function selectSkillForPrompt(prompt) {
+  const nvidiaKey = process.env.NVIDIA_API_KEY;
+  if (!nvidiaKey) throw new Error('NVIDIA_API_KEY not configured');
+
+  const intentLine = prompt.split('\n')[0];
+  const skillsDir = join(process.cwd(), '.agents', 'skills');
+  let skillCatalog = '';
+  const skillFiles = [];
+
+  if (existsSync(skillsDir)) {
+    const folders = readdirSync(skillsDir, { withFileTypes: true }).filter(d => d.isDirectory());
+    for (const folder of folders) {
+      const skillPath = join(skillsDir, folder.name, 'SKILL.md');
+      if (existsSync(skillPath)) {
+        const content = readFileSync(skillPath, 'utf-8');
+        skillFiles.push({ name: folder.name, content });
+        const descMatch = content.match(/description:\s*(.+)/);
+        const desc = descMatch ? descMatch[1] : 'No description';
+        skillCatalog += `- ${folder.name}: ${desc}\n`;
+      }
+    }
+  }
+
+  if (skillFiles.length === 0) {
+    return { skillName: 'generic', skillContent: '', reason: 'No skills found' };
+  }
+
+  const selectionPrompt = `You are a skill router. Given the user's intent: "${intentLine}"
+  
+Available skills:
+${skillCatalog}
+
+Which skill best matches? Return ONLY a JSON object: {"skillName": "name_of_skill", "reason": "brief reason why"}`;
+
+  try {
+    const selectionText = await generateNvidiaResponse(selectionPrompt, "You are a specialized router for video editing agents.");
+    const resp = JSON.parse(selectionText.replace(/```json\n?|```/g, ''));
+    const matched = skillFiles.find(s => s.name === resp.skillName);
+    if (matched) {
+      return { skillName: matched.name, skillContent: matched.content, reason: resp.reason };
+    }
+  } catch (e) {
+    console.warn("Skill selection failed, using fallback:", e.message);
+  }
+
+  return { skillName: skillFiles[0].name, skillContent: skillFiles[0].content, reason: 'Fallback to default' };
+}
+
+/**
+ * Negotiate Parameters
+ */
+async function negotiateParameters(prompt, skillContent) {
+  const nvidiaKey = process.env.NVIDIA_API_KEY;
+  if (!nvidiaKey) throw new Error('NVIDIA_API_KEY not configured');
+
+  const negotiationPrompt = `You are a parameter negotiator. Extract the required parameters from this skill description to fulfill the prompt.
+  
+SKILL DESCRIPTION:
+${skillContent}
+
+PROMPT:
+"${prompt}"
+
+Identify the question IDs (q_id) needed and generate the answers.
+Return ONLY valid JSON: {"parameters": {"q_id": "answer"}}`;
+
+  try {
+    const resultText = await generateNvidiaResponse(negotiationPrompt, "You are a technical negotiator.");
+    return JSON.parse(resultText.replace(/```json\n?|```/g, ''));
+  } catch (e) {
+    console.error("Negotiation failed:", e);
+    return { parameters: {} };
+  }
+}
+
+/**
+ * Q&A Synthesis Engine
+ */
+async function synthesizeFinalPrompt(skillContent, userPrompt, transcriptText, providedAnswers) {
+  const nvidiaKey = process.env.NVIDIA_API_KEY;
+  if (!nvidiaKey) throw new Error('NVIDIA_API_KEY not configured');
+
+  const synthPrompt = `You are an expert video editor agent. 
+You must execute the following SKILL:
+${skillContent}
+
+USER PROMPT: "${userPrompt}"
+TRANSCRIPT HIGHLIGHTS: "${transcriptText ? transcriptText.substring(0, 2000) : 'None'}"
+PROVIDED Q&A ANSWERS: ${JSON.stringify(providedAnswers || {})}
+
+Task:
+1. Review the "## Questions" block in the skill.
+2. Extract or calculate values for each question ID.
+3. Generate a precise, machine-readable parameter map and an execution plan.
+
+Return ONLY a valid JSON object:
+{
+  "calculated_parameters": {"q_id": "answer"},
+  "executionPlan": "detailed timeline plan"
+}`;
+
+  const responseText = await generateNvidiaResponse(synthPrompt, "You are an expert video editing architect.");
+  return JSON.parse(responseText.replace(/```json\n?|```/g, ''));
+}
+
+/**
+ * Handle new pre-negotiation API endpoint
+ */
+async function handleAutonomousSelectSkill(req, res) {
+  try {
+    const body = await parseBody(req);
+    if (!body.prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Missing prompt' }));
+    }
+
+    const { skillName, skillContent, reason } = await selectSkillForPrompt(body.prompt);
+
+    let questions = [];
+    try {
+      const qBlockMatch = skillContent.match(/## Questions[\s\S]*?questions:\s*([\s\S]+)$/);
+      if (qBlockMatch) {
+        const qTexts = qBlockMatch[1].split('- id:').filter(x => x.trim());
+        questions = qTexts.map(q => {
+          const idMatch = q.match(/\s*(.+)/);
+          const askMatch = q.match(/ask:\s*"([^"]+)"/);
+          return {
+            id: idMatch ? idMatch[1].trim() : '',
+            ask: askMatch ? askMatch[1] : ''
+          };
+        });
+      }
+    } catch (e) { }
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      selectedSkill: skillName,
+      reason,
+      questions,
+      guidance: 'Please provide the main video and answer these questions if possible.'
+    }));
+  } catch (e) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: e.message }));
+  }
+}
+
+/**
+ * Handle autonomous video processing from external systems
+ * Payload: multipart/form-data with 'video', 'logo' (optional), 'room_photo' (optional), 'prompt'
+ */
+async function handleAutonomousProcess(req, res) {
+  const jobId = randomUUID();
+  console.log(`\n[${jobId}] === AUTONOMOUS PROCESS START ===`);
+
+  try {
+    const form = formidable({
+      maxFileSize: 5 * 1024 * 1024 * 1024, // 5GB
+      uploadDir: TEMP_DIR,
+      keepExtensions: true,
+      multiples: true,
+    });
+
+    const [fields, files] = await form.parse(req);
+    const prompt = fields.prompt?.[0];
+    const videoFile = files.video?.[0];
+
+    if (!videoFile || !prompt) {
+      throw new Error('Missing video or prompt');
+    }
+
+    // 1. Create session
+    const session = createSession(videoFile.originalFilename || 'Autonomous Project');
+    const sessionId = session.id;
+
+    // 2. Register main video as asset
+    const { rename, stat, writeFile } = await import('fs/promises');
+    const videoId = randomUUID();
+    const videoPath = join(session.assetsDir, `${videoId}.mp4`);
+    await rename(videoFile.filepath, videoPath);
+
+    const videoStats = await stat(videoPath);
+    const videoDuration = await getVideoDuration(videoPath);
+
+    const mainAsset = {
+      id: videoId,
+      type: 'video',
+      filename: videoFile.originalFilename,
+      path: videoPath,
+      size: videoStats.size,
+      duration: videoDuration,
+      createdAt: Date.now(),
+    };
+    session.assets.set(videoId, mainAsset);
+
+    // 3. Register additional assets
+    if (files.logo?.[0]) {
+      const logoFile = files.logo[0];
+      const logoId = 'logo';
+      const logoPath = join(session.assetsDir, `logo${path.extname(logoFile.originalFilename)}`);
+      await rename(logoFile.filepath, logoPath);
+      session.assets.set(logoId, { id: logoId, type: 'image', filename: logoFile.originalFilename, path: logoPath });
+    }
+
+    const roomPhotos = files.room_photo || [];
+    for (let i = 0; i < roomPhotos.length; i++) {
+      const photo = roomPhotos[i];
+      const photoId = `photo-${i}`;
+      const photoPath = join(session.assetsDir, `photo-${i}${path.extname(photo.originalFilename)}`);
+      await rename(photo.filepath, photoPath);
+      session.assets.set(photoId, { id: photoId, type: 'image', filename: photo.originalFilename, path: photoPath });
+    }
+
+    saveAssetMetadata(session);
+
+    // 4. Send initial response so the caller knows the session is created
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      sessionId,
+      message: 'Autonomous process started.',
+      streamUrl: `/session/${sessionId}/stream`,
+    }));
+
+    // 5. Run automation steps in background
+    (async () => {
+      const apiKey = process.env.GEMINI_API_KEY;
+      try {
+        // Step 1: Select Skill
+        console.log(`[${jobId}] Step 1: Selecting skill...`);
+        const { skillName, skillContent } = await selectSkillForPrompt(prompt);
+        console.log(`[${jobId}] Selected skill: ${skillName}`);
+
+        // Step 2: Transcribe
+        console.log(`[${jobId}] Step 2: Transcribing...`);
+        const transcript = await internalTranscribe(session, mainAsset, mainAsset.duration, jobId);
+
+        // Step 3: Synthesize Q&A
+        console.log(`[${jobId}] Step 3: Synthesizing Q&A and Final Prompt...`);
+        let answers = {};
+        try { answers = JSON.parse(fields.answers?.[0] || '{}'); } catch (e) { }
+        const synthResponse = await synthesizeFinalPrompt(skillContent, prompt, transcript.text, answers);
+        console.log(`[${jobId}] Synthesized Plan:`, synthResponse.executionPlan);
+
+        // Step 4: Use NVIDIA NIM (MiniMax) to build the project based on final execution plan
+        console.log(`[${jobId}] Step 4: Designing project with NVIDIA NIM (MiniMax)...`);
+
+        const designPrompt = `You are an expert video editor executing a specific plan.
+        PLAN: "${synthResponse.executionPlan}"
+        VIDEO DURATION: ${mainAsset.duration}s
+        ASSETS: ${JSON.stringify(Array.from(session.assets.values()).map(a => ({ id: a.id, filename: a.filename })))}
+        
+        Create a project JSON with [clips] and [tracks] that implements this plan.
+        Return ONLY valid JSON: { "tracks": [...], "clips": [...] }`;
+
+        const projectText = await generateNvidiaResponse(designPrompt, "You are a senior technical video editor.");
+        const projectData = JSON.parse(projectText.replace(/```json\n?|```/g, ''));
+
+        session.project.clips = projectData.clips;
+        session.project.tracks = projectData.tracks;
+
+        console.log(`[${jobId}] Step 3: Auto-edit complete. Ready for render.`);
+        logSessionActivity(session, 'autonomous-design-complete', { clipCount: projectData.clips.length });
+
+      } catch (err) {
+        console.error(`[${jobId}] Background autonomous error:`, err.message);
+      }
+    })();
+
+  } catch (error) {
+    console.error(`[${jobId}] Autonomous setup error:`, error.message);
+    if (!res.writableEnded) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`\n🎬 Local FFmpeg server running at http://localhost:${PORT}`);
@@ -7843,3 +8071,83 @@ server.listen(PORT, () => {
   console.log(`   POST /session/:id/process-asset - Apply FFmpeg command to an asset`);
   console.log(`\n   GET /health - Health check\n`);
 });
+
+/**
+ * Internal helper for transcription using multiple providers (Whisper, OpenAI, Gemini)
+ */
+async function internalTranscribe(session, videoAsset, totalDuration, jobId) {
+  const audioPath = join(TEMP_DIR, `${jobId}-autonomous-audio.mp3`);
+
+  // Extract audio
+  await runFFmpeg([
+    '-y', '-i', videoAsset.path,
+    '-vn', '-acodec', 'libmp3lame',
+    '-ab', '64k', '-ar', '16000', '-ac', '1',
+    audioPath
+  ], jobId);
+
+  const hasLocalWhisper = await checkLocalWhisper();
+  const openaiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  let result;
+  if (hasLocalWhisper) {
+    result = await runLocalWhisper(audioPath, jobId);
+  } else if (openaiKey) {
+    result = await transcribeWithOpenAI(audioPath, openaiKey);
+  } else {
+    // Gemini fallback
+    const audioBuffer = readFileSync(audioPath);
+    const audioBase64 = audioBuffer.toString('base64');
+    const ai = new GoogleGenAI({ apiKey });
+    const geminiResponse = await ai.models.generateContent({
+      model: 'gemini-1.5-flash', // requested: gemini 2.5 flash nanobanana
+      contents: [{
+        role: 'user', parts: [
+          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+          { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+        ]
+      }]
+    });
+    const respText = geminiResponse.text || '';
+    try {
+      result = JSON.parse(respText);
+    } catch {
+      const match = respText.match(/\{[\s\S]*\}/);
+      result = match ? JSON.parse(match[0]) : { text: respText, words: [] };
+    }
+  }
+
+  try { unlinkSync(audioPath); } catch { }
+  return result;
+}
+
+// Helpers for Whisper API
+async function transcribeWithOpenAI(audioPath, apiKey) {
+  const audioBuffer = readFileSync(audioPath);
+  const { FormData } = await import('formdata-node');
+  const { Blob } = await import('node:buffer');
+
+  const formData = new FormData();
+  formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+  formData.append('model', 'whisper-1');
+  formData.append('response_format', 'verbose_json');
+  formData.append('timestamp_granularities[]', 'word');
+
+  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+    body: formData,
+  });
+
+  if (!response.ok) throw new Error(`Whisper API error: ${response.status}`);
+  const result = await response.json();
+  return {
+    text: result.text || '',
+    words: (result.words || []).map(w => ({
+      text: w.word || '',
+      start: w.start || 0,
+      end: w.end || 0,
+    }))
+  };
+}

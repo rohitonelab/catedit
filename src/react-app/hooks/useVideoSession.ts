@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 
-const LOCAL_FFMPEG_URL = 'http://localhost:3333';
+import { LOCAL_FFMPEG_URL } from '../constants';
 
 interface SessionInfo {
   sessionId: string;

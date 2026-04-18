@@ -1,7 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 
-const LOCAL_FFMPEG_URL = 'http://localhost:3333';
-const SESSION_STORAGE_KEY = 'clipwise-session';
+import { LOCAL_FFMPEG_URL, SESSION_STORAGE_KEY } from '../constants';
 
 // Asset - source file in library
 export interface Asset {
